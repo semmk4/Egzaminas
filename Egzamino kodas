@@ -24,7 +24,7 @@ from sklearn.dummy import DummyClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import average_precision_score, precision_score, recall_score, confusion_matrix
+from sklearn.metrics import average_precision_score, precision_score, recall_score, confusion_matrix, f1_score, accuracy_score
 import matplotlib.pyplot as plt
 from sklearn.metrics import PrecisionRecallDisplay
 
@@ -105,6 +105,44 @@ for n,m in models().items():
 base=pd.DataFrame(rows)
 base.to_csv(OUT/'main_results.csv',index=False)
 
+# 4B. PAPILDOMAS DAUGIAKLASIS GEDIMO TIPO EKSPERIMENTAS
+# Pagrindinis uždavinys yra dvejetainis, tačiau plane taip pat numatytas
+# papildomas gedimo tipo nustatymas. Gedimo tipai pateikiami TWF, HDF,
+# PWF, OSF ir RNF laukuose. Šie laukai nenaudojami dvejetainio modelio
+# įvestyje, tačiau naudojami kaip atskiras daugiaklasio uždavinio taikinys.
+# Įrašai be gedimo pašalinami, o įrašams su keliais aktyviais tipais
+# priskiriama klasė "Multiple".
+type_cols=['TWF','HDF','PWF','OSF','RNF']
+failure_df=df[df[target]==1].copy()
+def failure_type(row):
+    active=[c for c in type_cols if int(row[c])==1]
+    return active[0] if len(active)==1 else 'Multiple'
+failure_df['Failure type']=failure_df.apply(failure_type,axis=1)
+type_features=features
+Xt=failure_df[type_features].copy(); yt=failure_df['Failure type']
+Xt_tr,Xt_te,yt_tr,yt_te=train_test_split(Xt,yt,test_size=.2,stratify=yt,random_state=SEED)
+type_model=Pipeline([('pre',pre),('model',RandomForestClassifier(n_estimators=300,min_samples_leaf=2,class_weight='balanced_subsample',random_state=SEED,n_jobs=-1))])
+type_start=time.perf_counter(); type_model.fit(Xt_tr,yt_tr); type_pred=type_model.predict(Xt_te); type_seconds=time.perf_counter()-type_start
+type_result={'accuracy':accuracy_score(yt_te,type_pred),'macro_f1':f1_score(yt_te,type_pred,average='macro'),'weighted_f1':f1_score(yt_te,type_pred,average='weighted'),'test_rows':len(yt_te),'seconds':type_seconds,'classes':sorted(yt.unique().tolist())}
+(OUT/'failure_type_results.json').write_text(json.dumps(type_result,indent=2),encoding='utf-8')
+pd.DataFrame(confusion_matrix(yt_te,type_pred,labels=sorted(yt.unique()),)).to_csv(OUT/'failure_type_confusion_matrix.csv',index=False)
+
+# 4C. SPRENDIMO SLENKSČIO ANALIZĖ
+# PR-AUC nepriklauso nuo vieno slenksčio, tačiau praktiniam aliarmui
+# slenkstis svarbus. Analizuojame Random Forest tikimybes nuo 0,10 iki
+# 0,90 ir registruojame precision, recall, FP, FN bei pavyzdinę kainą.
+_,rf_pipe,rf_p=evaluate('Random Forest threshold analysis',models()['Random forest'])
+threshold_rows=[]
+for threshold in np.arange(.1,1.0,.1):
+    threshold_pred=(rf_p>=threshold).astype(int)
+    tn,fp,fn,tp=confusion_matrix(yte,threshold_pred,labels=[0,1]).ravel()
+    threshold_rows.append({'threshold':round(float(threshold),2),'precision':precision_score(yte,threshold_pred,zero_division=0),'recall':recall_score(yte,threshold_pred,zero_division=0),'fp':int(fp),'fn':int(fn),'cost_fn10_fp1':int(10*fn+fp)})
+threshold_df=pd.DataFrame(threshold_rows)
+threshold_df.to_csv(OUT/'threshold_analysis.csv',index=False)
+best_threshold=threshold_df.loc[threshold_df['cost_fn10_fp1'].idxmin()].to_dict()
+(OUT/'threshold_result.json').write_text(json.dumps(best_threshold,indent=2),encoding='utf-8')
+plt.figure(figsize=(8,5)); plt.plot(threshold_df['threshold'],threshold_df['precision'],marker='o',label='Precision'); plt.plot(threshold_df['threshold'],threshold_df['recall'],marker='o',label='Recall'); plt.xlabel('Sprendimo slenkstis'); plt.ylabel('Reikšmė'); plt.ylim(0,1); plt.grid(alpha=.3); plt.legend(); plt.title('Random Forest slenksčio analizė'); plt.tight_layout(); plt.savefig(OUT/'06_slenkscio_analize.png',dpi=180); plt.close()
+
 # 5. VIZUALŪS PAGRINDINIO EKSPERIMENTO ĮRODYMAI
 # Išsaugome PR-AUC stulpelinę diagramą, PR kreives ir Random Forest
 # klaidų matricą į ai4i_results katalogą.
@@ -156,6 +194,12 @@ summary={'rows':len(df),'failures':int(y.sum()),'failure_rate':float(y.mean()),'
 print('\n' + '='*72)
 print('EKSPERIMENTAI BAIGTI – PAGRINDINIAI REZULTATAI')
 print('='*72)
+print(f'Duomenų įrašų skaičius: {len(df)}')
+print(f'Gedimų skaičius: {int(y.sum())}')
+print(f'Gedimų dalis: {y.mean()*100:.2f}%')
+print(f'Mokymo įrašai: {len(Xtr)}; testo įrašai: {len(Xte)}')
+print(f'Naudota atsitiktinė sėkla: SEED={SEED}')
+print(f'Naudojamas sprendimo slenkstis pagrindiniame palyginime: 0.50')
 print(base[['model','pr_auc','precision','recall','fp','fn']].to_string(index=False))
 winner=base.loc[base['pr_auc'].idxmax()]
 print(f"\nGeriausias modelis pagal PR-AUC: {winner['model']} ({winner['pr_auc']:.4f})")
@@ -171,8 +215,102 @@ print('\nABLIACIJA – PAŠALINTAS TOOL WEAR')
 print(pd.DataFrame(ab)[['model','pr_auc','precision','recall']].to_string(index=False))
 print('\nATSPARUMAS')
 print(pd.DataFrame(rob)[['condition','pr_auc','precision','recall']].to_string(index=False))
+print('\nDAUGIAKLASIS GEDIMO TIPO EKSPERIMENTAS')
+print(json.dumps(type_result,indent=2,ensure_ascii=False))
+print('\nSLENKSČIO ANALIZĖ (10*FN + 1*FP KAINA)')
+print(threshold_df.to_string(index=False))
+print(f"Geriausias slenkstis pagal pavyzdinę klaidos kainą: {best_threshold['threshold']}")
+print('\nVYKDYMO LAIKAI (sekundėmis)')
+print(base[['model','seconds']].to_string(index=False))
+print(f"Pagrindinių modelių mokymo ir vertinimo laiko suma: {base['seconds'].sum():.4f} s")
+print(f"Daugiaklasio Random Forest laikas: {type_seconds:.4f} s")
+print(f"Bendras užregistruotas skaičiavimo laikas: {base['seconds'].sum()+type_seconds:.4f} s")
+print('\nSKAIČIAVIMO BIUDŽETO INTERPRETACIJA')
+print('Baseline ir logistinė regresija yra greičiausi atskaitos metodai.')
+print('MLP reikalauja daugiau laiko dėl iteracinio mokymo.')
+print('Random Forest laikas didesnis, nes mokoma 300 sprendimų medžių.')
+print('Laikai priklauso nuo naudojamo kompiuterio ir nėra universalus aparatinės įrangos etalonas.')
+print('\nPAGRINDINIAI IŠSAUGOTI REZULTATŲ FAILAI')
+for result_file in ['main_results.csv','ablation_results.csv','robustness_results.csv','hypothesis_result.json','failure_type_results.json','failure_type_confusion_matrix.csv','threshold_analysis.csv','threshold_result.json','01_modeliu_pr_auc.png','02_precision_recall_kreives.png','03_random_forest_klaidu_matrica.png','04_abliacija_tool_wear.png','05_atsparumo_grafikas.png','06_slenkscio_analize.png']:
+    print(f' - {OUT / result_file}')
 print(f"\nCSV lentelės ir grafikai išsaugoti kataloge: {OUT}")
 try:
     os.startfile(OUT)
 except OSError:
     print('Rezultatų katalogo automatiškai atidaryti nepavyko, tačiau failai išsaugoti.')
+
+# 11. IŠŠOKANTIS WINDOWS REZULTATŲ LANGAS
+# Paleidus failą iš Visual Studio arba dukart spustelėjus Python failą,
+# terminalo išvestis ne visada lieka matoma. Todėl papildomai sukuriamas
+# grafinis langas su slenkamu tekstu. Langas užsidaro paspaudus X arba
+# mygtuką „Uždaryti“.
+try:
+    import tkinter as tk
+    from tkinter.scrolledtext import ScrolledText
+
+    window = tk.Tk()
+    window.title('AI4I eksperimento rezultatai')
+    window.geometry('1050x760')
+    window.minsize(800, 500)
+
+    title = tk.Label(window, text='AI4I 2020 – eksperimento rezultatai',
+                     font=('Segoe UI', 16, 'bold'))
+    title.pack(pady=(12, 4))
+    subtitle = tk.Label(window, text='Gamybinio įrenginio gedimo prognozė',
+                        font=('Segoe UI', 10))
+    subtitle.pack(pady=(0, 8))
+
+    result_text = ScrolledText(window, wrap=tk.NONE, font=('Consolas', 10),
+                               background='#111827', foreground='#F9FAFB',
+                               insertbackground='white')
+    result_text.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+
+    popup_lines = []
+    popup_lines.append('=' * 92)
+    popup_lines.append('AI4I 2020 – EKSPERIMENTO REZULTATAI')
+    popup_lines.append('=' * 92)
+    popup_lines.append(f'Duomenų įrašų skaičius: {len(df)}')
+    popup_lines.append(f'Gedimų skaičius: {int(y.sum())} ({y.mean()*100:.2f}%)')
+    popup_lines.append(f'Mokymo įrašai: {len(Xtr)}; testo įrašai: {len(Xte)}')
+    popup_lines.append(f'Naudota sėkla: SEED={SEED}; pagrindinis slenkstis: 0.50')
+    popup_lines.append('')
+    popup_lines.append('PAGRINDINIŲ MODELIŲ METRIKOS')
+    popup_lines.append(base[['model','pr_auc','precision','recall','fp','fn']].to_string(index=False))
+    popup_lines.append(f'Geriausias modelis pagal PR-AUC: {winner["model"]} ({winner["pr_auc"]:.4f})')
+    popup_lines.append('')
+    popup_lines.append('MLP HIPOTEZĖ')
+    popup_lines.append(f'Logistinė regresija PR-AUC: {log_pr:.4f}')
+    popup_lines.append(f'MLP PR-AUC: {mlp_pr:.4f}')
+    popup_lines.append(f'Santykinis pagerėjimas: {relative_gain*100:.2f}%')
+    popup_lines.append('Rezultatas: PATVIRTINTA' if hypothesis_pass else 'Rezultatas: NEPATVIRTINTA')
+    popup_lines.append('')
+    popup_lines.append('ABLIACIJA – PAŠALINTAS TOOL WEAR')
+    popup_lines.append(pd.DataFrame(ab)[['model','pr_auc','precision','recall']].to_string(index=False))
+    popup_lines.append('')
+    popup_lines.append('ATSPARUMO EKSPERIMENTAS')
+    popup_lines.append(pd.DataFrame(rob)[['condition','pr_auc','precision','recall']].to_string(index=False))
+    popup_lines.append('')
+    popup_lines.append('DAUGIAKLASIS GEDIMO TIPO EKSPERIMENTAS')
+    popup_lines.append(f'Accuracy: {type_result["accuracy"]:.4f}; Macro-F1: {type_result["macro_f1"]:.4f}; Weighted-F1: {type_result["weighted_f1"]:.4f}')
+    popup_lines.append(f'Testo įrašai: {type_result["test_rows"]}; vykdymo laikas: {type_result["seconds"]:.4f} s')
+    popup_lines.append('')
+    popup_lines.append('SLENKSČIO ANALIZĖ – KAINA = 10 × FN + FP')
+    popup_lines.append(threshold_df.to_string(index=False))
+    popup_lines.append(f'Geriausias slenkstis pagal kainą: {best_threshold["threshold"]}')
+    popup_lines.append('')
+    popup_lines.append('SKAIČIAVIMO BIUDŽETAS')
+    popup_lines.append(base[['model','seconds']].to_string(index=False))
+    popup_lines.append(f'Pagrindinių modelių laiko suma: {base["seconds"].sum():.4f} s')
+    popup_lines.append(f'Daugiaklasio Random Forest laikas: {type_seconds:.4f} s')
+    popup_lines.append(f'Bendras užregistruotas laikas: {base["seconds"].sum()+type_seconds:.4f} s')
+    popup_lines.append('')
+    popup_lines.append(f'Visi CSV, JSON ir PNG failai: {OUT}')
+
+    result_text.insert('1.0', '\n'.join(popup_lines))
+    result_text.configure(state='disabled')
+    close_button = tk.Button(window, text='Uždaryti', command=window.destroy,
+                             font=('Segoe UI', 10), padx=20, pady=5)
+    close_button.pack(pady=(0, 12))
+    window.mainloop()
+except Exception as error:
+    print(f'Grafinio rezultatų lango atidaryti nepavyko: {error}')
