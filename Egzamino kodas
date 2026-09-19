@@ -1,0 +1,178 @@
+# ================================================================
+# AI4I 2020: GAMYBINIO ĮRENGINIO GEDIMO PROGNOZĖ
+#
+# Šis failas atlieka visą eksperimentą nuo CSV nuskaitymo iki grafikų
+# ir rezultatų failų sukūrimo. Kodas sąmoningai paliktas viename faile,
+# kad jį būtų paprasta atidaryti Visual Studio ir pakartoti.
+# ================================================================
+import json, time, os, sys, zipfile
+from urllib.request import urlopen
+# Windows PowerShell gali naudoti cp1252, todėl terminalo išvestį
+# perjungiame į UTF-8, kad būtų rodomos lietuviškos raidės.
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+except AttributeError:
+    pass
+from pathlib import Path
+import numpy as np, pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.dummy import DummyClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import average_precision_score, precision_score, recall_score, confusion_matrix
+import matplotlib.pyplot as plt
+from sklearn.metrics import PrecisionRecallDisplay
+
+# Fiksuota sėkla užtikrina, kad atsitiktinis duomenų skaidymas,
+# MLP mokymas, Random Forest ir triukšmo generavimas būtų atkuriami.
+SEED=42
+DATA=Path(r"C:\Users\Admin\Desktop\ai4i2020.csv")
+OUT=Path(r"C:\Users\Admin\Desktop\ai4i_results")
+OUT.mkdir(exist_ok=True)
+
+# Oficialus UCI AI4I 2020 ZIP archyvas. Jei vietinio CSV nėra,
+# failas automatiškai atsisiunčiamas ir išarchyvuojamas.
+UCI_URL='https://archive.ics.uci.edu/static/public/601/ai4i%2B2020%2Bpredictive%2Bmaintenance%2Bdataset.zip'
+def ensure_dataset(path):
+    if path.exists():
+        print(f'Naudojamas vietinis duomenų failas: {path}')
+        return
+    print('Vietinio CSV nėra – siunčiamas AI4I rinkinys iš oficialios UCI saugyklos...')
+    archive=path.parent/'ai4i2020_uci.zip'
+    with urlopen(UCI_URL, timeout=60) as response:
+        archive.write_bytes(response.read())
+    with zipfile.ZipFile(archive) as z:
+        candidates=[n for n in z.namelist() if n.lower().endswith('ai4i2020.csv')]
+        if not candidates:
+            raise FileNotFoundError('UCI archyve nerastas ai4i2020.csv')
+        path.write_bytes(z.read(candidates[0]))
+    print(f'Duomenys atsisiųsti į: {path}')
+
+ensure_dataset(DATA)
+
+# 1. DUOMENŲ NUSKAITYMAS IR TIKSLO NUTEKĖJIMO KONTROLĖ
+# CSV faile kiekviena eilutė aprašo vieną įrenginio darbo tašką.
+df=pd.read_csv(DATA)
+target='Machine failure'
+# Šie laukai susiję su jau nustatytu gedimu. Jeigu juos paliktume,
+# modelis galėtų tiesiogiai „pamatyti“ atsakymą, todėl tai būtų target leakage.
+leak=['TWF','HDF','PWF','OSF','RNF']
+# Identifikatoriai neturi fizikinės prognozinės reikšmės.
+id_cols=['UDI','Product ID']
+# Įvestyje paliekame tik jutiklių ir darbo režimo požymius.
+features=[c for c in df.columns if c not in [target,*leak,*id_cols]]
+y=df[target].astype(int)
+X=df[features].copy()
+
+# Type yra kategorinis požymis, kiti pasirinkti požymiai – skaitiniai.
+cat=['Type']; num=[c for c in features if c not in cat]
+# Preprocessing atliekamas Pipeline viduje, todėl medianos, vidurkiai,
+# standartiniai nuokrypiai ir kategorijų kodai išmokstami tik iš train aibės.
+pre=ColumnTransformer([('num',Pipeline([('imp',SimpleImputer(strategy='median')),('sc',StandardScaler())]),num),('cat',OneHotEncoder(handle_unknown='ignore'),cat)])
+# Testas atskiriamas vieną kartą ir vėliau naudojamas visiems modeliams.
+# Stratifikacija išlaiko gedimų proporciją abiejose aibėse.
+Xtr,Xte,ytr,yte=train_test_split(X,y,test_size=.2,stratify=y,random_state=SEED)
+
+# 2. MODELIAI IR JŲ NUSTATYMAI
+# Visi modeliai grąžina gedimo tikimybę, kad juos būtų galima lyginti PR-AUC.
+def models():
+ return {
+  'Majority baseline':DummyClassifier(strategy='most_frequent'),
+  'Logistic regression':LogisticRegression(max_iter=2000,class_weight='balanced',random_state=SEED),
+  'MLP':MLPClassifier(hidden_layer_sizes=(32,16),early_stopping=True,validation_fraction=.2,max_iter=500,random_state=SEED),
+  'Random forest':RandomForestClassifier(n_estimators=300,min_samples_leaf=2,class_weight='balanced_subsample',random_state=SEED,n_jobs=-1)
+ }
+# 3. BENDRA MOKYMO IR VERTINIMO FUNKCIJA
+# Viena funkcija užtikrina vienodas sąlygas visiems metodams:
+# tas pats preprocessing, tas pats split, tas pats slenkstis ir metrikos.
+def evaluate(name, model, xtr=Xtr, xte=Xte, ytr_=ytr, yte_=yte):
+ t=time.perf_counter(); pipe=Pipeline([('pre',pre),('model',model)]); pipe.fit(xtr,ytr_); p=pipe.predict_proba(xte)[:,1] if hasattr(pipe,'predict_proba') else pipe.decision_function(xte)
+ pred=(p>=.5).astype(int); tn,fp,fn,tp=confusion_matrix(yte_,pred,labels=[0,1]).ravel()
+ row={'model':name,'pr_auc':average_precision_score(yte_,p),'precision':precision_score(yte_,pred,zero_division=0),'recall':recall_score(yte_,pred,zero_division=0),'tn':int(tn),'fp':int(fp),'fn':int(fn),'tp':int(tp),'seconds':time.perf_counter()-t}
+ return row,pipe,p
+
+# 4. PAGRINDINIS EKSPERIMENTAS
+# Testo aibė nėra naudojama parametrų paieškai. Parametrai aprašyti
+# models() funkcijoje ir nustatyti prieš galutinį vertinimą.
+rows=[]
+for n,m in models().items():
+ r,_,_=evaluate(n,m); rows.append(r)
+base=pd.DataFrame(rows)
+base.to_csv(OUT/'main_results.csv',index=False)
+
+# 5. VIZUALŪS PAGRINDINIO EKSPERIMENTO ĮRODYMAI
+# Išsaugome PR-AUC stulpelinę diagramą, PR kreives ir Random Forest
+# klaidų matricą į ai4i_results katalogą.
+plt.figure(figsize=(9,5)); plt.bar(base['model'],base['pr_auc'],color=['gray','steelblue','darkorange','seagreen']); plt.ylabel('PR-AUC'); plt.title('Modelių PR-AUC palyginimas'); plt.xticks(rotation=20,ha='right'); plt.ylim(0,1); plt.tight_layout(); plt.savefig(OUT/'01_modeliu_pr_auc.png',dpi=180); plt.close()
+plt.figure(figsize=(8,6))
+for n,m in models().items():
+    _,pipe,p=evaluate(n,m); PrecisionRecallDisplay.from_predictions(yte,p,name=n,ax=plt.gca())
+plt.title('Precision–Recall kreivės'); plt.tight_layout(); plt.savefig(OUT/'02_precision_recall_kreives.png',dpi=180); plt.close()
+_,best_pipe,best_p=evaluate('Random Forest',models()['Random forest']); best_pred=(best_p>=.5).astype(int); cm=confusion_matrix(yte,best_pred,labels=[0,1])
+fig,ax=plt.subplots(figsize=(5,4)); im=ax.imshow(cm,cmap='Blues'); ax.set_xticks([0,1],['Normalus','Gedimas']); ax.set_yticks([0,1],['Normalus','Gedimas']); ax.set_xlabel('Prognozė'); ax.set_ylabel('Tikroji klasė'); ax.set_title('Random Forest klaidų matrica');
+for i in range(2):
+ for j in range(2): ax.text(j,i,str(cm[i,j]),ha='center',va='center',color='white' if cm[i,j]>cm.max()/2 else 'black')
+fig.colorbar(im,ax=ax); fig.tight_layout(); fig.savefig(OUT/'03_random_forest_klaidu_matrica.png',dpi=180); plt.close(fig)
+
+# 6. ABLIACIJOS EKSPERIMENTAS
+# Pašaliname Tool wear [min] ir iš naujo apmokome modelius.
+# Keičiame tik požymių rinkinį; split, seed ir metrikos išlieka tie patys.
+ab_features=[c for c in features if c!='Tool wear [min]']; ab_cat=['Type']; ab_num=[c for c in ab_features if c not in ab_cat]
+ab_pre=ColumnTransformer([('num',Pipeline([('imp',SimpleImputer(strategy='median')),('sc',StandardScaler())]),ab_num),('cat',OneHotEncoder(handle_unknown='ignore'),ab_cat)])
+Xa=df[ab_features]; Xa_tr,Xa_te,ya_tr,ya_te=train_test_split(Xa,y,test_size=.2,stratify=y,random_state=SEED)
+ab=[]
+for n,m in [('Logistic regression - no tool wear',models()['Logistic regression']),('MLP - no tool wear',models()['MLP']),('Random forest - no tool wear',models()['Random forest'])]:
+ t=time.perf_counter(); pipe=Pipeline([('pre',ab_pre),('model',m)]); pipe.fit(Xa_tr,ya_tr); p=pipe.predict_proba(Xa_te)[:,1]; pred=(p>=.5).astype(int); tn,fp,fn,tp=confusion_matrix(ya_te,pred,labels=[0,1]).ravel(); ab.append({'model':n,'pr_auc':average_precision_score(ya_te,p),'precision':precision_score(ya_te,pred,zero_division=0),'recall':recall_score(ya_te,pred,zero_division=0),'tn':int(tn),'fp':int(fp),'fn':int(fn),'tp':int(tp),'seconds':time.perf_counter()-t})
+pd.DataFrame(ab).to_csv(OUT/'ablation_results.csv',index=False)
+abdf=pd.DataFrame(ab); plt.figure(figsize=(8,5)); plt.bar(abdf['model'],abdf['pr_auc'],color='indianred'); plt.ylabel('PR-AUC'); plt.title('Abliacija: pašalintas Tool wear'); plt.xticks(rotation=20,ha='right'); plt.ylim(0,1); plt.tight_layout(); plt.savefig(OUT/'04_abliacija_tool_wear.png',dpi=180); plt.close()
+
+# 7. ATSPARUMO EKSPERIMENTAS
+# Naudojame apmokytą logistinės regresijos modelį ir keičiame tik testo
+# kopijas: pridedame triukšmą arba pašaliname dviejų jutiklių reikšmes.
+# Originali testo aibė lieka nepakeista.
+_,logpipe,_=evaluate('logistic robustness',models()['Logistic regression'])
+# Triukšmas pridedamas tik tiems jutikliams, kurie plane nurodyti:
+# oro temperatūrai, proceso temperatūrai ir sukimosi greičiui.
+rng=np.random.default_rng(SEED); noisy=Xte.copy(); noise_cols=['Air temperature [K]','Process temperature [K]','Rotational speed [rpm]']; scales=noisy[noise_cols].std().replace(0,1).to_numpy(); noisy[noise_cols]=noisy[noise_cols].to_numpy()+rng.normal(0,0.05,noisy[noise_cols].shape)*scales
+missing=noisy.copy(); missing.loc[:,['Torque [Nm]','Rotational speed [rpm]']]=np.nan
+rob=[]
+for label,xx in [('clean',Xte),('sensor noise',noisy),('missing sensors',missing)]:
+ p=logpipe.predict_proba(xx)[:,1]; pred=(p>=.5).astype(int); tn,fp,fn,tp=confusion_matrix(yte,pred,labels=[0,1]).ravel(); rob.append({'condition':label,'pr_auc':average_precision_score(yte,p),'precision':precision_score(yte,pred,zero_division=0),'recall':recall_score(yte,pred,zero_division=0),'tn':int(tn),'fp':int(fp),'fn':int(fn),'tp':int(tp)})
+pd.DataFrame(rob).to_csv(OUT/'robustness_results.csv',index=False)
+robdf=pd.DataFrame(rob); x=np.arange(len(robdf)); w=.25; fig,ax=plt.subplots(figsize=(9,5)); ax.bar(x-w,robdf['pr_auc'],w,label='PR-AUC'); ax.bar(x,robdf['precision'],w,label='Precision'); ax.bar(x+w,robdf['recall'],w,label='Recall'); ax.set_xticks(x,robdf['condition']); ax.set_ylim(0,1); ax.set_ylabel('Reikšmė'); ax.set_title('Atsparumas triukšmui ir trūkstamiems jutikliams'); ax.legend(); fig.tight_layout(); fig.savefig(OUT/'05_atsparumo_grafikas.png',dpi=180); plt.close(fig)
+
+# 8. SANTRAUKA IR REZULTATŲ IŠVEDIMAS
+# JSON faile išsaugome pagrindinius eksperimento nustatymus atkūrimui.
+summary={'rows':len(df),'failures':int(y.sum()),'failure_rate':float(y.mean()),'features':features,'leakage_removed':leak,'seed':SEED}
+(OUT/'dataset_summary.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
+# 9. GALUTINIS AUTOMATINIS REZULTATŲ PARODYMAS
+# Paleidus failą, rezultatai parodomi terminale, o rezultatų katalogas
+# automatiškai atidaromas Windows Explorer lange.
+print('\n' + '='*72)
+print('EKSPERIMENTAI BAIGTI – PAGRINDINIAI REZULTATAI')
+print('='*72)
+print(base[['model','pr_auc','precision','recall','fp','fn']].to_string(index=False))
+winner=base.loc[base['pr_auc'].idxmax()]
+print(f"\nGeriausias modelis pagal PR-AUC: {winner['model']} ({winner['pr_auc']:.4f})")
+# 10. HIPOTEZĖS PATIKRINIMAS
+# Plane iškelta hipotezė: MLP PR-AUC turi būti bent 15 % didesnis
+# už logistinės regresijos PR-AUC. Skaičiuojamas santykinis skirtumas.
+log_pr=float(base.loc[base['model']=='Logistic regression','pr_auc'].iloc[0]); mlp_pr=float(base.loc[base['model']=='MLP','pr_auc'].iloc[0]); relative_gain=(mlp_pr-log_pr)/log_pr if log_pr else float('inf'); hypothesis_pass=relative_gain>=0.15
+print(f"\nHIPOTEZĖ: MLP PR-AUC turi būti bent 15 % didesnis už logistinės regresijos PR-AUC")
+print(f"Logistinė regresija: {log_pr:.4f}; MLP: {mlp_pr:.4f}; santykinis skirtumas: {relative_gain*100:.2f} %")
+print('Hipotezė PATVIRTINTA.' if hypothesis_pass else 'Hipotezė NEPATVIRTINTA.')
+(OUT/'hypothesis_result.json').write_text(json.dumps({'logistic_pr_auc':log_pr,'mlp_pr_auc':mlp_pr,'relative_gain':relative_gain,'threshold':0.15,'supported':hypothesis_pass},indent=2),encoding='utf-8')
+print('\nABLIACIJA – PAŠALINTAS TOOL WEAR')
+print(pd.DataFrame(ab)[['model','pr_auc','precision','recall']].to_string(index=False))
+print('\nATSPARUMAS')
+print(pd.DataFrame(rob)[['condition','pr_auc','precision','recall']].to_string(index=False))
+print(f"\nCSV lentelės ir grafikai išsaugoti kataloge: {OUT}")
+try:
+    os.startfile(OUT)
+except OSError:
+    print('Rezultatų katalogo automatiškai atidaryti nepavyko, tačiau failai išsaugoti.')
