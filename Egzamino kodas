@@ -25,14 +25,24 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import average_precision_score, precision_score, recall_score, confusion_matrix, f1_score, accuracy_score
+# Priverčiame matplotlib naudoti negrafinę 'Agg' foninę sistemą (tik
+# failų į diską braižymui), kad ji nesikonfliktuotų su programos
+# pabaigoje sukuriamu tkinter rezultatų langu (11 skyrius). Kodas visur
+# naudoja savefig(), o ne plt.show(), todėl grafinė matplotlib sąsaja
+# čia visiškai nereikalinga.
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from sklearn.metrics import PrecisionRecallDisplay
+from catboost import CatBoostClassifier
+from xgboost import XGBClassifier
 
 # Fiksuota sėkla užtikrina, kad atsitiktinis duomenų skaidymas,
 # MLP mokymas, Random Forest ir triukšmo generavimas būtų atkuriami.
 SEED=42
-DATA=Path(r"C:\Users\Admin\Desktop\ai4i2020.csv")
-OUT=Path(r"C:\Users\Admin\Desktop\ai4i_results")
+# Naudojami reliatyvūs keliai, kad kodas veiktų bet kuriame kompiuteryje
+DATA=Path("ai4i2020.csv")
+OUT=Path("ai4i_results")
 OUT.mkdir(exist_ok=True)
 
 # Oficialus UCI AI4I 2020 ZIP archyvas. Jei vietinio CSV nėra,
@@ -80,43 +90,107 @@ Xtr,Xte,ytr,yte=train_test_split(X,y,test_size=.2,stratify=y,random_state=SEED)
 
 # 2. MODELIAI IR JŲ NUSTATYMAI
 # Visi modeliai grąžina gedimo tikimybę, kad juos būtų galima lyginti PR-AUC.
-def models():
+POS_WEIGHT=(ytr==0).sum()/(ytr==1).sum()
+
+def make_xgb(params):
+ return XGBClassifier(objective='binary:logistic',eval_metric='logloss',random_state=SEED,n_jobs=-1,scale_pos_weight=POS_WEIGHT,**params)
+
+class OversampledPipeline:
+ def __init__(self, preprocessor, model, seed=SEED):
+  self.preprocessor=preprocessor; self.model=model; self.seed=seed
+ def fit(self, X, y):
+  y_arr=np.asarray(y)
+  Xenc=self.preprocessor.fit_transform(X, y_arr)
+  rng=np.random.default_rng(self.seed)
+  minority=np.where(y_arr==1)[0]; majority=np.where(y_arr==0)[0]
+  n_extra=max(len(majority)-len(minority),0)
+  extra=rng.choice(minority,size=n_extra,replace=True) if n_extra>0 else np.array([],dtype=int)
+  balanced_idx=np.concatenate([np.arange(len(y_arr)),extra]); rng.shuffle(balanced_idx)
+  self.model.fit(Xenc[balanced_idx], y_arr[balanced_idx])
+  return self
+ def predict_proba(self, X):
+  return self.model.predict_proba(self.preprocessor.transform(X))
+
+def models(xgb_params=None):
+ if xgb_params is None:
+  xgb_params={'n_estimators':400,'max_depth':4,'learning_rate':.05,'subsample':.85,'colsample_bytree':.90}
  return {
   'Majority baseline':DummyClassifier(strategy='most_frequent'),
   'Logistic regression':LogisticRegression(max_iter=2000,class_weight='balanced',random_state=SEED),
   'MLP':MLPClassifier(hidden_layer_sizes=(32,16),early_stopping=True,validation_fraction=.2,max_iter=500,random_state=SEED),
-  'Random forest':RandomForestClassifier(n_estimators=300,min_samples_leaf=2,class_weight='balanced_subsample',random_state=SEED,n_jobs=-1)
+  'Random forest':RandomForestClassifier(n_estimators=300,min_samples_leaf=2,class_weight='balanced_subsample',random_state=SEED,n_jobs=-1),
+  'XGBoost':make_xgb(xgb_params)
  }
 # 3. BENDRA MOKYMO IR VERTINIMO FUNKCIJA
 # Viena funkcija užtikrina vienodas sąlygas visiems metodams:
 # tas pats preprocessing, tas pats split, tas pats slenkstis ir metrikos.
-def evaluate(name, model, xtr=Xtr, xte=Xte, ytr_=ytr, yte_=yte):
- t=time.perf_counter(); pipe=Pipeline([('pre',pre),('model',model)]); pipe.fit(xtr,ytr_); p=pipe.predict_proba(xte)[:,1] if hasattr(pipe,'predict_proba') else pipe.decision_function(xte)
+def evaluate(name, model, xtr=Xtr, xte=Xte, ytr_=ytr, yte_=yte, oversample=False):
+ t=time.perf_counter(); pipe=OversampledPipeline(pre,model,seed=SEED) if oversample else Pipeline([('pre',pre),('model',model)]); pipe.fit(xtr,ytr_); p=pipe.predict_proba(xte)[:,1] if hasattr(pipe,'predict_proba') else pipe.decision_function(xte)
  pred=(p>=.5).astype(int); tn,fp,fn,tp=confusion_matrix(yte_,pred,labels=[0,1]).ravel()
  row={'model':name,'pr_auc':average_precision_score(yte_,p),'precision':precision_score(yte_,pred,zero_division=0),'recall':recall_score(yte_,pred,zero_division=0),'tn':int(tn),'fp':int(fp),'fn':int(fn),'tp':int(tp),'seconds':time.perf_counter()-t}
  return row,pipe,p
 
+# CatBoost gauna ne One-Hot koduotą Type reikšmę. Skaitinių požymių medianos
+# imamos tik iš mokymo aibės, todėl testo aibė nedalyvauja paruošimo etape.
+def catboost_data(train, data):
+ result=data.copy()
+ result[num]=result[num].fillna(train[num].median())
+ result['Type']=result['Type'].fillna('Unknown').astype(str)
+ return result
+
+def evaluate_catboost(name, params, xtr=Xtr, xte=Xte, ytr_=ytr, yte_=yte):
+ t=time.perf_counter()
+ model=CatBoostClassifier(loss_function='Logloss',eval_metric='PRAUC',auto_class_weights='Balanced',random_seed=SEED,verbose=False,allow_writing_files=False,thread_count=-1,**params)
+ train_data=catboost_data(xtr,xtr); test_data=catboost_data(xtr,xte)
+ model.fit(train_data,ytr_,cat_features=['Type'])
+ p=model.predict_proba(test_data)[:,1]; pred=(p>=.5).astype(int); tn,fp,fn,tp=confusion_matrix(yte_,pred,labels=[0,1]).ravel()
+ row={'model':name,'pr_auc':average_precision_score(yte_,p),'precision':precision_score(yte_,pred,zero_division=0),'recall':recall_score(yte_,pred,zero_division=0),'tn':int(tn),'fp':int(fp),'fn':int(fn),'tp':int(tp),'seconds':time.perf_counter()-t}
+ return row,model,p
+
+# Parametrų variantai bandomi tik Xtr viduje. Xte/yte paliekami galutiniam,
+# vienkartiniam palyginimui, todėl modeliai neturi prieigos prie testo rezultatų.
+Xfit,Xval,yfit,yval=train_test_split(Xtr,ytr,test_size=.20,stratify=ytr,random_state=SEED)
+xgb_variants=[
+ {'variant':'XGB-A: 250 trees, depth 3','n_estimators':250,'max_depth':3,'learning_rate':.05,'subsample':.85,'colsample_bytree':.90},
+ {'variant':'XGB-B: 400 trees, depth 4','n_estimators':400,'max_depth':4,'learning_rate':.05,'subsample':.85,'colsample_bytree':.90},
+ {'variant':'XGB-C: 500 trees, depth 5','n_estimators':500,'max_depth':5,'learning_rate':.03,'subsample':.90,'colsample_bytree':.90}]
+catboost_variants=[
+ {'variant':'CAT-A: 300 iterations, depth 4','iterations':300,'depth':4,'learning_rate':.05},
+ {'variant':'CAT-B: 500 iterations, depth 6','iterations':500,'depth':6,'learning_rate':.05},
+ {'variant':'CAT-C: 600 iterations, depth 8','iterations':600,'depth':8,'learning_rate':.03}]
+search_rows=[]
+for spec in xgb_variants:
+ params={k:v for k,v in spec.items() if k!='variant'}; row,_,_=evaluate(spec['variant'],make_xgb(params),Xfit,Xval,yfit,yval); row['method']='XGBoost'; row['variant']=spec['variant']; search_rows.append(row)
+for spec in catboost_variants:
+ params={k:v for k,v in spec.items() if k!='variant'}; row,_,_=evaluate_catboost(spec['variant'],params,Xfit,Xval,yfit,yval); row['method']='CatBoost'; row['variant']=spec['variant']; search_rows.append(row)
+search_df=pd.DataFrame(search_rows); search_df.to_csv(OUT/'model_variant_search.csv',index=False)
+xgb_best_variant=search_df[search_df['method']=='XGBoost'].sort_values('pr_auc',ascending=False).iloc[0]['variant']
+catboost_best_variant=search_df[search_df['method']=='CatBoost'].sort_values('pr_auc',ascending=False).iloc[0]['variant']
+xgb_best_params={k:v for k,v in next(s for s in xgb_variants if s['variant']==xgb_best_variant).items() if k!='variant'}
+catboost_best_params={k:v for k,v in next(s for s in catboost_variants if s['variant']==catboost_best_variant).items() if k!='variant'}
+(OUT/'model_variant_search_summary.json').write_text(json.dumps({'selection_data':'80% training subset only; final test untouched','xgboost_selected':xgb_best_variant,'catboost_selected':catboost_best_variant},indent=2),encoding='utf-8')
+
 # 4. PAGRINDINIS EKSPERIMENTAS
 # Testo aibė nėra naudojama parametrų paieškai. Parametrai aprašyti
 # models() funkcijoje ir nustatyti prieš galutinį vertinimą.
-rows=[]
-for n,m in models().items():
- r,_,_=evaluate(n,m); rows.append(r)
+rows=[]; main_predictions={}
+for n,m in models(xgb_best_params).items():
+ r,_,p=evaluate(n,m,oversample=(n=='MLP')); rows.append(r); main_predictions[n]=p
+cat_row,cat_model,cat_p=evaluate_catboost('CatBoost',catboost_best_params)
+rows.append(cat_row); main_predictions['CatBoost']=cat_p
 base=pd.DataFrame(rows)
 base.to_csv(OUT/'main_results.csv',index=False)
 
 # 4B. PAPILDOMAS DAUGIAKLASIS GEDIMO TIPO EKSPERIMENTAS
-# Pagrindinis uždavinys yra dvejetainis, tačiau plane taip pat numatytas
-# papildomas gedimo tipo nustatymas. Gedimo tipai pateikiami TWF, HDF,
-# PWF, OSF ir RNF laukuose. Šie laukai nenaudojami dvejetainio modelio
-# įvestyje, tačiau naudojami kaip atskiras daugiaklasio uždavinio taikinys.
-# Įrašai be gedimo pašalinami, o įrašams su keliais aktyviais tipais
-# priskiriama klasė "Multiple".
 type_cols=['TWF','HDF','PWF','OSF','RNF']
 failure_df=df[df[target]==1].copy()
 def failure_type(row):
     active=[c for c in type_cols if int(row[c])==1]
-    return active[0] if len(active)==1 else 'Multiple'
+    if len(active)==1:
+        return active[0]
+    if len(active)==0:
+        return 'Unknown'
+    return 'Multiple'
 failure_df['Failure type']=failure_df.apply(failure_type,axis=1)
 type_features=features
 Xt=failure_df[type_features].copy(); yt=failure_df['Failure type']
@@ -129,33 +203,45 @@ pd.DataFrame(confusion_matrix(yt_te,type_pred,labels=sorted(yt.unique()),)).to_c
 
 # 4C. SPRENDIMO SLENKSČIO ANALIZĖ
 # PR-AUC nepriklauso nuo vieno slenksčio, tačiau praktiniam aliarmui
-# slenkstis svarbus. Analizuojame Random Forest tikimybes nuo 0,10 iki
+# slenkstis svarbus. Analizuojame pagrindinio XGBoost modelio tikimybes nuo 0,10 iki
 # 0,90 ir registruojame precision, recall, FP, FN bei pavyzdinę kainą.
-_,rf_pipe,rf_p=evaluate('Random Forest threshold analysis',models()['Random forest'])
+_,xgb_pipe,xgb_p=evaluate('XGBoost threshold analysis',make_xgb(xgb_best_params))
 threshold_rows=[]
 for threshold in np.arange(.1,1.0,.1):
-    threshold_pred=(rf_p>=threshold).astype(int)
+    threshold_pred=(xgb_p>=threshold).astype(int)
     tn,fp,fn,tp=confusion_matrix(yte,threshold_pred,labels=[0,1]).ravel()
     threshold_rows.append({'threshold':round(float(threshold),2),'precision':precision_score(yte,threshold_pred,zero_division=0),'recall':recall_score(yte,threshold_pred,zero_division=0),'fp':int(fp),'fn':int(fn),'cost_fn10_fp1':int(10*fn+fp)})
 threshold_df=pd.DataFrame(threshold_rows)
 threshold_df.to_csv(OUT/'threshold_analysis.csv',index=False)
 best_threshold=threshold_df.loc[threshold_df['cost_fn10_fp1'].idxmin()].to_dict()
 (OUT/'threshold_result.json').write_text(json.dumps(best_threshold,indent=2),encoding='utf-8')
-plt.figure(figsize=(8,5)); plt.plot(threshold_df['threshold'],threshold_df['precision'],marker='o',label='Precision'); plt.plot(threshold_df['threshold'],threshold_df['recall'],marker='o',label='Recall'); plt.xlabel('Sprendimo slenkstis'); plt.ylabel('Reikšmė'); plt.ylim(0,1); plt.grid(alpha=.3); plt.legend(); plt.title('Random Forest slenksčio analizė'); plt.tight_layout(); plt.savefig(OUT/'06_slenkscio_analize.png',dpi=180); plt.close()
+plt.figure(figsize=(8,5)); plt.plot(threshold_df['threshold'],threshold_df['precision'],marker='o',label='Precision'); plt.plot(threshold_df['threshold'],threshold_df['recall'],marker='o',label='Recall'); plt.xlabel('Sprendimo slenkstis'); plt.ylabel('Reikšmė'); plt.ylim(0,1); plt.grid(alpha=.3); plt.legend(); plt.title('XGBoost slenksčio analizė'); plt.tight_layout(); plt.savefig(OUT/'06_slenkscio_analize.png',dpi=180); plt.close()
 
 # 5. VIZUALŪS PAGRINDINIO EKSPERIMENTO ĮRODYMAI
-# Išsaugome PR-AUC stulpelinę diagramą, PR kreives ir Random Forest
+# Išsaugome PR-AUC stulpelinę diagramą, PR kreives ir pagrindinio XGBoost
 # klaidų matricą į ai4i_results katalogą.
-plt.figure(figsize=(9,5)); plt.bar(base['model'],base['pr_auc'],color=['gray','steelblue','darkorange','seagreen']); plt.ylabel('PR-AUC'); plt.title('Modelių PR-AUC palyginimas'); plt.xticks(rotation=20,ha='right'); plt.ylim(0,1); plt.tight_layout(); plt.savefig(OUT/'01_modeliu_pr_auc.png',dpi=180); plt.close()
+plt.figure(figsize=(10,5)); plt.bar(base['model'],base['pr_auc'],color=plt.cm.tab10.colors[:len(base)]); plt.ylabel('PR-AUC'); plt.title('Modelių PR-AUC palyginimas'); plt.xticks(rotation=20,ha='right'); plt.ylim(0,1); plt.tight_layout(); plt.savefig(OUT/'01_modeliu_pr_auc.png',dpi=180); plt.close()
 plt.figure(figsize=(8,6))
-for n,m in models().items():
-    _,pipe,p=evaluate(n,m); PrecisionRecallDisplay.from_predictions(yte,p,name=n,ax=plt.gca())
+for n,m in models(xgb_best_params).items():
+    _,pipe,p=evaluate(n,m,oversample=(n=='MLP')); PrecisionRecallDisplay.from_predictions(yte,p,name=n,ax=plt.gca())
+PrecisionRecallDisplay.from_predictions(yte,cat_p,name='CatBoost',ax=plt.gca())
 plt.title('Precision–Recall kreivės'); plt.tight_layout(); plt.savefig(OUT/'02_precision_recall_kreives.png',dpi=180); plt.close()
-_,best_pipe,best_p=evaluate('Random Forest',models()['Random forest']); best_pred=(best_p>=.5).astype(int); cm=confusion_matrix(yte,best_pred,labels=[0,1])
-fig,ax=plt.subplots(figsize=(5,4)); im=ax.imshow(cm,cmap='Blues'); ax.set_xticks([0,1],['Normalus','Gedimas']); ax.set_yticks([0,1],['Normalus','Gedimas']); ax.set_xlabel('Prognozė'); ax.set_ylabel('Tikroji klasė'); ax.set_title('Random Forest klaidų matrica');
+
+# Prognozės ir fakto palyginimas: tikros klasės bei tikimybės surikiuotos
+# pagal pagrindinio XGBoost prognozę, todėl tiesiogiai matomi FP ir FN atvejai.
+plot_p=main_predictions['XGBoost']; order=np.argsort(plot_p)
+fig,ax=plt.subplots(figsize=(11,5)); ax.plot(np.arange(len(yte)),plot_p[order],label='XGBoost prognozuota gedimo tikimybė',color='seagreen'); ax.scatter(np.arange(len(yte)),yte.to_numpy()[order],s=12,alpha=.65,label='Faktinė klasė (0 arba 1)',color='black'); ax.axhline(.5,color='crimson',linestyle='--',label='Slenkstis 0,50'); ax.set_xlabel('Testo įrašai, surikiuoti pagal prognozuotą tikimybę'); ax.set_ylabel('Tikimybė / faktinė klasė'); ax.set_ylim(-.05,1.05); ax.set_title('XGBoost prognozės ir fakto palyginimas'); ax.grid(alpha=.25); ax.legend(loc='upper left'); fig.tight_layout(); fig.savefig(OUT/'08_prognoze_vs_faktas.png',dpi=180); plt.close(fig)
+_,best_pipe,best_p=evaluate('XGBoost',make_xgb(xgb_best_params)); best_pred=(best_p>=.5).astype(int); cm=confusion_matrix(yte,best_pred,labels=[0,1])
+fig,ax=plt.subplots(figsize=(5,4)); im=ax.imshow(cm,cmap='Blues'); ax.set_xticks([0,1],['Normalus','Gedimas']); ax.set_yticks([0,1],['Normalus','Gedimas']); ax.set_xlabel('Prognozė'); ax.set_ylabel('Tikroji klasė'); ax.set_title('XGBoost klaidų matrica');
 for i in range(2):
  for j in range(2): ax.text(j,i,str(cm[i,j]),ha='center',va='center',color='white' if cm[i,j]>cm.max()/2 else 'black')
-fig.colorbar(im,ax=ax); fig.tight_layout(); fig.savefig(OUT/'03_random_forest_klaidu_matrica.png',dpi=180); plt.close(fig)
+fig.colorbar(im,ax=ax); fig.tight_layout(); fig.savefig(OUT/'03_xgboost_klaidu_matrica.png',dpi=180); plt.close(fig)
+
+# Konkretūs pagrindinio XGBoost modelio FP ir FN pavyzdžiai ataskaitai.
+error_data=Xte.copy(); error_data['Tikroji klasė']=yte.to_numpy(); error_data['Prognozė']=best_pred; error_data['Gedimo tikimybė']=best_p
+fn_examples=error_data[(error_data['Tikroji klasė']==1)&(error_data['Prognozė']==0)].sort_values('Gedimo tikimybė',ascending=False).head(5).copy(); fn_examples['Klaidos tipas']='FN'
+fp_examples=error_data[(error_data['Tikroji klasė']==0)&(error_data['Prognozė']==1)].sort_values('Gedimo tikimybė',ascending=False).head(5).copy(); fp_examples['Klaidos tipas']='FP'
+error_examples=pd.concat([fn_examples,fp_examples]); error_examples.insert(0,'Pradinis indeksas',error_examples.index); error_examples.to_csv(OUT/'error_examples.csv',index=False)
 
 # 6. ABLIACIJOS EKSPERIMENTAS
 # Pašaliname Tool wear [min] ir iš naujo apmokome modelius.
@@ -164,23 +250,23 @@ ab_features=[c for c in features if c!='Tool wear [min]']; ab_cat=['Type']; ab_n
 ab_pre=ColumnTransformer([('num',Pipeline([('imp',SimpleImputer(strategy='median')),('sc',StandardScaler())]),ab_num),('cat',OneHotEncoder(handle_unknown='ignore'),ab_cat)])
 Xa=df[ab_features]; Xa_tr,Xa_te,ya_tr,ya_te=train_test_split(Xa,y,test_size=.2,stratify=y,random_state=SEED)
 ab=[]
-for n,m in [('Logistic regression - no tool wear',models()['Logistic regression']),('MLP - no tool wear',models()['MLP']),('Random forest - no tool wear',models()['Random forest'])]:
- t=time.perf_counter(); pipe=Pipeline([('pre',ab_pre),('model',m)]); pipe.fit(Xa_tr,ya_tr); p=pipe.predict_proba(Xa_te)[:,1]; pred=(p>=.5).astype(int); tn,fp,fn,tp=confusion_matrix(ya_te,pred,labels=[0,1]).ravel(); ab.append({'model':n,'pr_auc':average_precision_score(ya_te,p),'precision':precision_score(ya_te,pred,zero_division=0),'recall':recall_score(ya_te,pred,zero_division=0),'tn':int(tn),'fp':int(fp),'fn':int(fn),'tp':int(tp),'seconds':time.perf_counter()-t})
+for n,m in [('Logistic regression - no tool wear',models()['Logistic regression']),('MLP - no tool wear',models()['MLP']),('Random forest - no tool wear',models()['Random forest']),('XGBoost - no tool wear',make_xgb(xgb_best_params))]:
+ t=time.perf_counter(); pipe=OversampledPipeline(ab_pre,m,seed=SEED) if n=='MLP - no tool wear' else Pipeline([('pre',ab_pre),('model',m)]); pipe.fit(Xa_tr,ya_tr); p=pipe.predict_proba(Xa_te)[:,1]; pred=(p>=.5).astype(int); tn,fp,fn,tp=confusion_matrix(ya_te,pred,labels=[0,1]).ravel(); ab.append({'model':n,'pr_auc':average_precision_score(ya_te,p),'precision':precision_score(ya_te,pred,zero_division=0),'recall':recall_score(ya_te,pred,zero_division=0),'tn':int(tn),'fp':int(fp),'fn':int(fn),'tp':int(tp),'seconds':time.perf_counter()-t})
 pd.DataFrame(ab).to_csv(OUT/'ablation_results.csv',index=False)
 abdf=pd.DataFrame(ab); plt.figure(figsize=(8,5)); plt.bar(abdf['model'],abdf['pr_auc'],color='indianred'); plt.ylabel('PR-AUC'); plt.title('Abliacija: pašalintas Tool wear'); plt.xticks(rotation=20,ha='right'); plt.ylim(0,1); plt.tight_layout(); plt.savefig(OUT/'04_abliacija_tool_wear.png',dpi=180); plt.close()
 
 # 7. ATSPARUMO EKSPERIMENTAS
-# Naudojame apmokytą logistinės regresijos modelį ir keičiame tik testo
+# Naudojame pagrindinį XGBoost modelį ir keičiame tik testo
 # kopijas: pridedame triukšmą arba pašaliname dviejų jutiklių reikšmes.
 # Originali testo aibė lieka nepakeista.
-_,logpipe,_=evaluate('logistic robustness',models()['Logistic regression'])
+_,primary_pipe,_=evaluate('XGBoost robustness',make_xgb(xgb_best_params))
 # Triukšmas pridedamas tik tiems jutikliams, kurie plane nurodyti:
 # oro temperatūrai, proceso temperatūrai ir sukimosi greičiui.
 rng=np.random.default_rng(SEED); noisy=Xte.copy(); noise_cols=['Air temperature [K]','Process temperature [K]','Rotational speed [rpm]']; scales=noisy[noise_cols].std().replace(0,1).to_numpy(); noisy[noise_cols]=noisy[noise_cols].to_numpy()+rng.normal(0,0.05,noisy[noise_cols].shape)*scales
 missing=noisy.copy(); missing.loc[:,['Torque [Nm]','Rotational speed [rpm]']]=np.nan
 rob=[]
 for label,xx in [('clean',Xte),('sensor noise',noisy),('missing sensors',missing)]:
- p=logpipe.predict_proba(xx)[:,1]; pred=(p>=.5).astype(int); tn,fp,fn,tp=confusion_matrix(yte,pred,labels=[0,1]).ravel(); rob.append({'condition':label,'pr_auc':average_precision_score(yte,p),'precision':precision_score(yte,pred,zero_division=0),'recall':recall_score(yte,pred,zero_division=0),'tn':int(tn),'fp':int(fp),'fn':int(fn),'tp':int(tp)})
+ p=primary_pipe.predict_proba(xx)[:,1]; pred=(p>=.5).astype(int); tn,fp,fn,tp=confusion_matrix(yte,pred,labels=[0,1]).ravel(); rob.append({'condition':label,'pr_auc':average_precision_score(yte,p),'precision':precision_score(yte,pred,zero_division=0),'recall':recall_score(yte,pred,zero_division=0),'tn':int(tn),'fp':int(fp),'fn':int(fn),'tp':int(tp)})
 pd.DataFrame(rob).to_csv(OUT/'robustness_results.csv',index=False)
 robdf=pd.DataFrame(rob); x=np.arange(len(robdf)); w=.25; fig,ax=plt.subplots(figsize=(9,5)); ax.bar(x-w,robdf['pr_auc'],w,label='PR-AUC'); ax.bar(x,robdf['precision'],w,label='Precision'); ax.bar(x+w,robdf['recall'],w,label='Recall'); ax.set_xticks(x,robdf['condition']); ax.set_ylim(0,1); ax.set_ylabel('Reikšmė'); ax.set_title('Atsparumas triukšmui ir trūkstamiems jutikliams'); ax.legend(); fig.tight_layout(); fig.savefig(OUT/'05_atsparumo_grafikas.png',dpi=180); plt.close(fig)
 
@@ -203,6 +289,9 @@ print(f'Naudojamas sprendimo slenkstis pagrindiniame palyginime: 0.50')
 print(base[['model','pr_auc','precision','recall','fp','fn']].to_string(index=False))
 winner=base.loc[base['pr_auc'].idxmax()]
 print(f"\nGeriausias modelis pagal PR-AUC: {winner['model']} ({winner['pr_auc']:.4f})")
+print('\nPARAMETRŲ VARIANTŲ PAIEŠKA (tik mokymo aibės validacijoje)')
+print(search_df[['method','variant','pr_auc','precision','recall']].to_string(index=False))
+print(f'Galutiniam testui pasirinkta: {xgb_best_variant}; {catboost_best_variant}')
 # 10. HIPOTEZĖS PATIKRINIMAS
 # Plane iškelta hipotezė: MLP PR-AUC turi būti bent 15 % didesnis
 # už logistinės regresijos PR-AUC. Skaičiuojamas santykinis skirtumas.
@@ -231,86 +320,82 @@ print('MLP reikalauja daugiau laiko dėl iteracinio mokymo.')
 print('Random Forest laikas didesnis, nes mokoma 300 sprendimų medžių.')
 print('Laikai priklauso nuo naudojamo kompiuterio ir nėra universalus aparatinės įrangos etalonas.')
 print('\nPAGRINDINIAI IŠSAUGOTI REZULTATŲ FAILAI')
-for result_file in ['main_results.csv','ablation_results.csv','robustness_results.csv','hypothesis_result.json','failure_type_results.json','failure_type_confusion_matrix.csv','threshold_analysis.csv','threshold_result.json','01_modeliu_pr_auc.png','02_precision_recall_kreives.png','03_random_forest_klaidu_matrica.png','04_abliacija_tool_wear.png','05_atsparumo_grafikas.png','06_slenkscio_analize.png']:
-    print(f' - {OUT / result_file}')
+for result_file in ['main_results.csv','model_variant_search.csv','model_variant_search_summary.json','ablation_results.csv','robustness_results.csv','hypothesis_result.json','failure_type_results.json','failure_type_confusion_matrix.csv','threshold_analysis.csv','threshold_result.json','error_examples.csv','01_modeliu_pr_auc.png','02_precision_recall_kreives.png','03_xgboost_klaidu_matrica.png','04_abliacija_tool_wear.png','05_atsparumo_grafikas.png','06_slenkscio_analize.png','08_prognoze_vs_faktas.png']:
+ print(f' - {OUT / result_file}')
 print(f"\nCSV lentelės ir grafikai išsaugoti kataloge: {OUT}")
 try:
-    os.startfile(OUT)
+ os.startfile(OUT)
 except OSError:
-    print('Rezultatų katalogo automatiškai atidaryti nepavyko, tačiau failai išsaugoti.')
+ print('Rezultatų katalogo automatiškai atidaryti nepavyko, tačiau failai išsaugoti.')
 
 # 11. IŠŠOKANTIS WINDOWS REZULTATŲ LANGAS
-# Paleidus failą iš Visual Studio arba dukart spustelėjus Python failą,
-# terminalo išvestis ne visada lieka matoma. Todėl papildomai sukuriamas
-# grafinis langas su slenkamu tekstu. Langas užsidaro paspaudus X arba
-# mygtuką „Uždaryti“.
 try:
-    import tkinter as tk
-    from tkinter.scrolledtext import ScrolledText
+ import tkinter as tk
+ from tkinter.scrolledtext import ScrolledText
 
-    window = tk.Tk()
-    window.title('AI4I eksperimento rezultatai')
-    window.geometry('1050x760')
-    window.minsize(800, 500)
+ window = tk.Tk()
+ window.title('AI4I eksperimento rezultatai')
+ window.geometry('1050x760')
+ window.minsize(800, 500)
 
-    title = tk.Label(window, text='AI4I 2020 – eksperimento rezultatai',
-                     font=('Segoe UI', 16, 'bold'))
-    title.pack(pady=(12, 4))
-    subtitle = tk.Label(window, text='Gamybinio įrenginio gedimo prognozė',
-                        font=('Segoe UI', 10))
-    subtitle.pack(pady=(0, 8))
+ title = tk.Label(window, text='AI4I 2020 – eksperimento rezultatai',
+                  font=('Segoe UI', 16, 'bold'))
+ title.pack(pady=(12, 4))
+ subtitle = tk.Label(window, text='Gamybinio įrenginio gedimo prognozė',
+                     font=('Segoe UI', 10))
+ subtitle.pack(pady=(0, 8))
 
-    result_text = ScrolledText(window, wrap=tk.NONE, font=('Consolas', 10),
-                               background='#111827', foreground='#F9FAFB',
-                               insertbackground='white')
-    result_text.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+ result_text = ScrolledText(window, wrap=tk.NONE, font=('Consolas', 10),
+                            background='#111827', foreground='#F9FAFB',
+                            insertbackground='white')
+ result_text.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
 
-    popup_lines = []
-    popup_lines.append('=' * 92)
-    popup_lines.append('AI4I 2020 – EKSPERIMENTO REZULTATAI')
-    popup_lines.append('=' * 92)
-    popup_lines.append(f'Duomenų įrašų skaičius: {len(df)}')
-    popup_lines.append(f'Gedimų skaičius: {int(y.sum())} ({y.mean()*100:.2f}%)')
-    popup_lines.append(f'Mokymo įrašai: {len(Xtr)}; testo įrašai: {len(Xte)}')
-    popup_lines.append(f'Naudota sėkla: SEED={SEED}; pagrindinis slenkstis: 0.50')
-    popup_lines.append('')
-    popup_lines.append('PAGRINDINIŲ MODELIŲ METRIKOS')
-    popup_lines.append(base[['model','pr_auc','precision','recall','fp','fn']].to_string(index=False))
-    popup_lines.append(f'Geriausias modelis pagal PR-AUC: {winner["model"]} ({winner["pr_auc"]:.4f})')
-    popup_lines.append('')
-    popup_lines.append('MLP HIPOTEZĖ')
-    popup_lines.append(f'Logistinė regresija PR-AUC: {log_pr:.4f}')
-    popup_lines.append(f'MLP PR-AUC: {mlp_pr:.4f}')
-    popup_lines.append(f'Santykinis pagerėjimas: {relative_gain*100:.2f}%')
-    popup_lines.append('Rezultatas: PATVIRTINTA' if hypothesis_pass else 'Rezultatas: NEPATVIRTINTA')
-    popup_lines.append('')
-    popup_lines.append('ABLIACIJA – PAŠALINTAS TOOL WEAR')
-    popup_lines.append(pd.DataFrame(ab)[['model','pr_auc','precision','recall']].to_string(index=False))
-    popup_lines.append('')
-    popup_lines.append('ATSPARUMO EKSPERIMENTAS')
-    popup_lines.append(pd.DataFrame(rob)[['condition','pr_auc','precision','recall']].to_string(index=False))
-    popup_lines.append('')
-    popup_lines.append('DAUGIAKLASIS GEDIMO TIPO EKSPERIMENTAS')
-    popup_lines.append(f'Accuracy: {type_result["accuracy"]:.4f}; Macro-F1: {type_result["macro_f1"]:.4f}; Weighted-F1: {type_result["weighted_f1"]:.4f}')
-    popup_lines.append(f'Testo įrašai: {type_result["test_rows"]}; vykdymo laikas: {type_result["seconds"]:.4f} s')
-    popup_lines.append('')
-    popup_lines.append('SLENKSČIO ANALIZĖ – KAINA = 10 × FN + FP')
-    popup_lines.append(threshold_df.to_string(index=False))
-    popup_lines.append(f'Geriausias slenkstis pagal kainą: {best_threshold["threshold"]}')
-    popup_lines.append('')
-    popup_lines.append('SKAIČIAVIMO BIUDŽETAS')
-    popup_lines.append(base[['model','seconds']].to_string(index=False))
-    popup_lines.append(f'Pagrindinių modelių laiko suma: {base["seconds"].sum():.4f} s')
-    popup_lines.append(f'Daugiaklasio Random Forest laikas: {type_seconds:.4f} s')
-    popup_lines.append(f'Bendras užregistruotas laikas: {base["seconds"].sum()+type_seconds:.4f} s')
-    popup_lines.append('')
-    popup_lines.append(f'Visi CSV, JSON ir PNG failai: {OUT}')
+ popup_lines = []
+ popup_lines.append('=' * 92)
+ popup_lines.append('AI4I 2020 – EKSPERIMENTO REZULTATAI')
+ popup_lines.append('=' * 92)
+ popup_lines.append(f'Duomenų įrašų skaičius: {len(df)}')
+ popup_lines.append(f'Gedimų skaičius: {int(y.sum())} ({y.mean()*100:.2f}%)')
+ popup_lines.append(f'Mokymo įrašai: {len(Xtr)}; testo įrašai: {len(Xte)}')
+ popup_lines.append(f'Naudota sėkla: SEED={SEED}; pagrindinis slenkstis: 0.50')
+ popup_lines.append('')
+ popup_lines.append('PAGRINDINIŲ MODELIŲ METRIKOS')
+ popup_lines.append(base[['model','pr_auc','precision','recall','fp','fn']].to_string(index=False))
+ popup_lines.append(f'Geriausias modelis pagal PR-AUC: {winner["model"]} ({winner["pr_auc"]:.4f})')
+ popup_lines.append('')
+ popup_lines.append('MLP HIPOTEZĖ')
+ popup_lines.append(f'Logistinė regresija PR-AUC: {log_pr:.4f}')
+ popup_lines.append(f'MLP PR-AUC: {mlp_pr:.4f}')
+ popup_lines.append(f'Santykinis pagerėjimas: {relative_gain*100:.2f}%')
+ popup_lines.append('Rezultatas: PATVIRTINTA' if hypothesis_pass else 'Rezultatas: NEPATVIRTINTA')
+ popup_lines.append('')
+ popup_lines.append('ABLIACIJA – PAŠALINTAS TOOL WEAR')
+ popup_lines.append(pd.DataFrame(ab)[['model','pr_auc','precision','recall']].to_string(index=False))
+ popup_lines.append('')
+ popup_lines.append('ATSPARUMO EKSPERIMENTAS')
+ popup_lines.append(pd.DataFrame(rob)[['condition','pr_auc','precision','recall']].to_string(index=False))
+ popup_lines.append('')
+ popup_lines.append('DAUGIAKLASIS GEDIMO TIPO EKSPERIMENTAS')
+ popup_lines.append(f'Accuracy: {type_result["accuracy"]:.4f}; Macro-F1: {type_result["macro_f1"]:.4f}; Weighted-F1: {type_result["weighted_f1"]:.4f}')
+ popup_lines.append(f'Testo įrašai: {type_result["test_rows"]}; vykdymo laikas: {type_result["seconds"]:.4f} s')
+ popup_lines.append('')
+ popup_lines.append('SLENKSČIO ANALIZĖ – KAINA = 10 × FN + FP')
+ popup_lines.append(threshold_df.to_string(index=False))
+ popup_lines.append(f'Geriausias slenkstis pagal kainą: {best_threshold["threshold"]}')
+ popup_lines.append('')
+ popup_lines.append('SKAIČIAVIMO BIUDŽETAS')
+ popup_lines.append(base[['model','seconds']].to_string(index=False))
+ popup_lines.append(f'Pagrindinių modelių laiko suma: {base["seconds"].sum():.4f} s')
+ popup_lines.append(f'Daugiaklasio Random Forest laikas: {type_seconds:.4f} s')
+ popup_lines.append(f'Bendras užregistruotas laikas: {base["seconds"].sum()+type_seconds:.4f} s')
+ popup_lines.append('')
+ popup_lines.append(f'Visi CSV, JSON ir PNG failai: {OUT}')
 
-    result_text.insert('1.0', '\n'.join(popup_lines))
-    result_text.configure(state='disabled')
-    close_button = tk.Button(window, text='Uždaryti', command=window.destroy,
-                             font=('Segoe UI', 10), padx=20, pady=5)
-    close_button.pack(pady=(0, 12))
-    window.mainloop()
+ result_text.insert('1.0', '\n'.join(popup_lines))
+ result_text.configure(state='disabled')
+ close_button = tk.Button(window, text='Uždaryti', command=window.destroy,
+                          font=('Segoe UI', 10), padx=20, pady=5)
+ close_button.pack(pady=(0, 12))
+ window.mainloop()
 except Exception as error:
-    print(f'Grafinio rezultatų lango atidaryti nepavyko: {error}')
+ print(f'Grafinio rezultatų lango atidaryti nepavyko: {error}')
